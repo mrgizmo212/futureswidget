@@ -14,7 +14,7 @@ CORS(app, resources={
         "origins": [
             "http://localhost:8881",
             "http://localhost",
-            "https://futuresfeed.net",  # Add your WordPress domain
+            "https://truetradinggroup.com/",  # Add your WordPress domain
         ],
         "methods": ["GET"],
         "allow_headers": ["Content-Type"],
