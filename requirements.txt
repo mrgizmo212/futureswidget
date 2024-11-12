@@ -2,3 +2,5 @@ databento
 Flask
 gunicorn
 flask-cors
+fastapi
+uvicorn
