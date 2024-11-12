@@ -1,5 +1,5 @@
 from flask import Flask, jsonify
-from flask_cors import CORS  # Added CORS support
+from flask_cors import CORS
 import databento as db
 from datetime import datetime, timezone
 import threading
@@ -7,10 +7,13 @@ import logging
 import os
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class LiveQuoteManager:
@@ -21,9 +24,10 @@ class LiveQuoteManager:
 
     def start_live_feed(self):
         try:
-            self.client = db.Live(key=os.environ.get('DATABENTO_KEY', 'db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK'))
+            # Get API key from environment variable or use default
+            api_key = os.environ.get('DATABENTO_KEY', 'db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK')
+            self.client = db.Live(key=api_key)
             
-            # Subscribe to ES continuous front month
             self.client.subscribe(
                 dataset="GLBX.MDP3",
                 schema="trades",
@@ -32,8 +36,8 @@ class LiveQuoteManager:
             )
             
             self.running = True
+            logger.info("Live feed started successfully")
             
-            # Start processing live data
             for record in self.client:
                 if not self.running:
                     break
@@ -53,27 +57,23 @@ class LiveQuoteManager:
                         }
                         
                         self.latest_quotes["ES.c.0"] = quote_data
-                        logger.info(f"Updated quote: {quote_data}")
+                        logger.info(f"Quote updated: {quote_data}")
                         
                     except Exception as e:
-                        logger.error(f"Error processing record: {str(e)}")
+                        logger.error(f"Record processing error: {str(e)}")
                         
         except Exception as e:
-            logger.error(f"Feed error: {str(e)}")
-            self.latest_quotes["ES.c.0"] = {"error": str(e)}
+            error_msg = f"Feed error: {str(e)}"
+            logger.error(error_msg)
+            self.latest_quotes["ES.c.0"] = {"error": error_msg}
 
     def stop_live_feed(self):
         self.running = False
         if self.client:
             self.client.stop()
+        logger.info("Live feed stopped")
 
-# Global quote manager
 quote_manager = LiveQuoteManager()
-
-def start_feed():
-    feed_thread = threading.Thread(target=quote_manager.start_live_feed)
-    feed_thread.daemon = True
-    feed_thread.start()
 
 @app.route('/')
 def get_quote():
@@ -82,9 +82,18 @@ def get_quote():
         "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     })
 
-# Start the feed when the application starts
+def start_feed():
+    feed_thread = threading.Thread(target=quote_manager.start_live_feed)
+    feed_thread.daemon = True
+    feed_thread.start()
+    logger.info("Feed thread started")
+
+# Initialize the feed
 with app.app_context():
     start_feed()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+    # Get port from environment variable (for Render) or use 8000 (for local)
+    port = int(os.environ.get('PORT', 8000))
+    logger.info(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port)
