@@ -20,8 +20,10 @@ class LiveQuoteManager:
 
     def start_live_feed(self):
         try:
+            logger.info("Connecting to Databento...")
             self.client = db.Live(key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK")
             
+            logger.info("Subscribing to ES futures...")
             self.client.subscribe(
                 dataset="GLBX.MDP3",
                 schema="trades",
@@ -51,7 +53,7 @@ class LiveQuoteManager:
                         }
                         
                         self.latest_quotes["ES.c.0"] = quote_data
-                        logger.info(f"Quote: {quote_data}")
+                        logger.info(f"Updated quote: {quote_data}")
                         
                     except Exception as e:
                         logger.error(f"Error processing record: {str(e)}")
@@ -69,6 +71,7 @@ quote_manager = LiveQuoteManager()
 
 @app.route('/')
 def get_quote():
+    logger.info(f"Current quotes: {quote_manager.latest_quotes}")  # Add logging
     return jsonify({
         "quotes": quote_manager.latest_quotes,
         "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -78,7 +81,9 @@ def start_feed():
     feed_thread = threading.Thread(target=quote_manager.start_live_feed)
     feed_thread.daemon = True
     feed_thread.start()
+    logger.info("Feed thread started")
 
+# Initialize the feed
 with app.app_context():
     start_feed()
 
