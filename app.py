@@ -7,9 +7,25 @@ import logging
 import os
 
 app = Flask(__name__)
-CORS(app)
 
-logging.basicConfig(level=logging.INFO)
+# Configure CORS for your WordPress domain
+CORS(app, resources={
+    r"/": {
+        "origins": [
+            "http://localhost:8881",
+            "http://localhost",
+            "https://futuresfeed.net",  # Add your WordPress domain
+        ],
+        "methods": ["GET"],
+        "allow_headers": ["Content-Type"],
+    }
+})
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class LiveQuoteManager:
@@ -32,7 +48,7 @@ class LiveQuoteManager:
             )
             
             self.running = True
-            logger.info("Feed started")
+            logger.info("Feed started successfully")
             
             for record in self.client:
                 if not self.running:
@@ -66,12 +82,13 @@ class LiveQuoteManager:
         self.running = False
         if self.client:
             self.client.stop()
+        logger.info("Feed stopped")
 
 quote_manager = LiveQuoteManager()
 
 @app.route('/')
 def get_quote():
-    logger.info(f"Current quotes: {quote_manager.latest_quotes}")  # Add logging
+    logger.info(f"Quote request received")
     return jsonify({
         "quotes": quote_manager.latest_quotes,
         "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
