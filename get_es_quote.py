@@ -1,46 +1,64 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask, jsonify
 import databento as db
-import json
 from datetime import datetime, timezone
 import threading
+import logging
+import os
+
+app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class LiveQuoteManager:
     def __init__(self):
-        self.latest_quote = {"error": "Waiting for data..."}
+        self.latest_quotes = {"ES.c.0": {"error": "Waiting for data..."}}
         self.client = None
         self.running = False
 
     def start_live_feed(self):
-        self.client = db.Live(key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK")
-        
-        # Subscribe to ES continuous front month
-        self.client.subscribe(
-            dataset="GLBX.MDP3",
-            schema="trades",
-            stype_in="continuous",
-            symbols=["ES.c.0"]
-        )
-        
-        self.running = True
-        
-        # Start processing live data
-        for record in self.client:
-            if not self.running:
-                break
-                
-            if isinstance(record, db.TradeMsg):
-                # Convert nanoseconds to seconds and create timestamp
-                ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
-                
-                self.latest_quote = {
-                    "symbol": "ES",
-                    "price": float(record.price) / 1e9,
-                    "size": int(record.size),
-                    "timestamp": ts_event.strftime('%H:%M:%S'),
-                    "side": record.side,
-                    "date": ts_event.strftime('%Y-%m-%d')
-                }
-                print(f"Updated quote: {self.latest_quote}")
+        try:
+            self.client = db.Live(key=os.environ.get('DATABENTO_KEY', 'db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK'))
+            
+            # Subscribe to ES continuous front month
+            self.client.subscribe(
+                dataset="GLBX.MDP3",
+                schema="trades",
+                stype_in="continuous",
+                symbols=["ES.c.0"]
+            )
+            
+            self.running = True
+            
+            # Start processing live data
+            for record in self.client:
+                if not self.running:
+                    break
+                    
+                if isinstance(record, db.TradeMsg):
+                    try:
+                        ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
+                        
+                        quote_data = {
+                            "symbol": "ES",
+                            "price": float(record.price) / 1e9,
+                            "size": int(record.size),
+                            "timestamp": ts_event.strftime('%H:%M:%S'),
+                            "side": record.side,
+                            "date": ts_event.strftime('%Y-%m-%d'),
+                            "status": "live"
+                        }
+                        
+                        self.latest_quotes["ES.c.0"] = quote_data
+                        logger.info(f"Updated quote: {quote_data}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing record: {str(e)}")
+                        
+        except Exception as e:
+            logger.error(f"Feed error: {str(e)}")
+            self.latest_quotes["ES.c.0"] = {"error": str(e)}
 
     def stop_live_feed(self):
         self.running = False
@@ -50,48 +68,18 @@ class LiveQuoteManager:
 # Global quote manager
 quote_manager = LiveQuoteManager()
 
-class QuoteHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            # Send the latest quote
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps(quote_manager.latest_quote).encode())
+@app.route('/')
+def get_quote():
+    return jsonify({
+        "quotes": quote_manager.latest_quotes,
+        "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    })
 
-        except Exception as e:
-            error_response = {"error": str(e)}
-            print(f"Error occurred: {str(e)}")
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps(error_response).encode())
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-
-def run_server(port=8000):
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, QuoteHandler)
-    print(f"Server running on port {port}")
-    
-    # Start the live feed in a separate thread
+@app.before_first_request
+def start_feed():
     feed_thread = threading.Thread(target=quote_manager.start_live_feed)
     feed_thread.daemon = True
     feed_thread.start()
-    
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-        quote_manager.stop_live_feed()
-        httpd.server_close()
 
 if __name__ == '__main__':
-    run_server()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
