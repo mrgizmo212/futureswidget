@@ -1,6 +1,7 @@
-databento
-Flask
-gunicorn
-flask-cors
 fastapi
 uvicorn
+databento
+python-dotenv
+httpx
+pydantic
+typing-extensions
