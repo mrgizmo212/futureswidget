@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Dict, Any
 from threading import Lock
+from pytz import timezone as pytz_timezone
 
 app = FastAPI(title="Futures Quotes API")
 
@@ -47,7 +48,10 @@ class LiveQuoteManager:
         self.running = False
         self.last_updates = {ticker: datetime.now(timezone.utc) for ticker in self.SUPPORTED_TICKERS}
         self.lock = Lock()
-        self.instrument_map = {}  # Map instrument_ids to symbols
+        self.instrument_map = {}
+        
+        # Initialize timezone
+        self.eastern_tz = pytz_timezone('America/New_York')
 
     def start_live_feed(self):
         try:
@@ -85,15 +89,17 @@ class LiveQuoteManager:
                         if not ticker or ticker not in self.SUPPORTED_TICKERS:
                             continue
                         
+                        # Convert UTC timestamp to Eastern Time
                         ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
+                        ts_event_eastern = ts_event.astimezone(self.eastern_tz)
                         
                         quote_data = {
                             "symbol": ticker.split('.')[0],  # Remove the .c.0 suffix
                             "price": float(record.price) / 1e9,
                             "size": int(record.size),
-                            "timestamp": ts_event.strftime('%H:%M:%S'),
+                            "timestamp": ts_event_eastern.strftime('%I:%M:%S %p'),  # 12-hour format with AM/PM
                             "side": record.side,
-                            "date": ts_event.strftime('%Y-%m-%d'),
+                            "date": ts_event_eastern.strftime('%Y-%m-%d'),
                             "status": "live"
                         }
                         
@@ -142,6 +148,9 @@ quote_manager = LiveQuoteManager()
 @app.get("/")
 async def get_quotes(symbol: str = None) -> Dict[str, Any]:
     """Get the latest futures quotes"""
+    current_time = datetime.now(timezone.utc)
+    eastern_time = current_time.astimezone(quote_manager.eastern_tz)
+    
     if symbol:
         # Convert to continuous contract format if needed
         ticker = f"{symbol.upper()}.c.0"
@@ -151,13 +160,13 @@ async def get_quotes(symbol: str = None) -> Dict[str, Any]:
         if not quote_manager.is_feed_healthy(ticker):
             return {
                 "quotes": {ticker: {"error": "Feed unavailable - reconnecting..."}},
-                "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
                 "status": "unhealthy"
             }
             
         return {
             "quotes": {ticker: quote_manager.latest_quotes[ticker]},
-            "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+            "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "healthy"
         }
     
@@ -169,19 +178,22 @@ async def get_quotes(symbol: str = None) -> Dict[str, Any]:
                 ticker: {"error": "Feed unavailable - reconnecting..."}
                 for ticker in quote_manager.SUPPORTED_TICKERS
             },
-            "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+            "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "unhealthy"
         }
     
     return {
         "quotes": quote_manager.latest_quotes,
-        "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
         "status": "healthy"
     }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    current_time = datetime.now(timezone.utc)
+    eastern_time = current_time.astimezone(quote_manager.eastern_tz)
+    
     health_status = {
         ticker: quote_manager.is_feed_healthy(ticker)
         for ticker in quote_manager.SUPPORTED_TICKERS
@@ -191,11 +203,11 @@ async def health_check():
         "status": "healthy" if all(health_status.values()) else "unhealthy",
         "ticker_status": health_status,
         "last_updates": {
-            ticker: update_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            ticker: update_time.astimezone(quote_manager.eastern_tz).strftime('%Y-%m-%d %I:%M:%S %p %Z')
             for ticker, update_time in quote_manager.last_updates.items()
         },
-        "running": quote_manager.running,
-        "mapped_instruments": len(quote_manager.instrument_map)
+        "current_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
+        "running": quote_manager.running
     }
 
 def start_feed():
