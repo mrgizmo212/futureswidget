@@ -47,6 +47,7 @@ class LiveQuoteManager:
         self.running = False
         self.last_updates = {ticker: datetime.now(timezone.utc) for ticker in self.SUPPORTED_TICKERS}
         self.lock = Lock()
+        self.instrument_map = {}  # Map instrument_ids to symbols
 
     def start_live_feed(self):
         try:
@@ -61,6 +62,14 @@ class LiveQuoteManager:
                 symbols=self.SUPPORTED_TICKERS
             )
             
+            # Initialize symbol mapping
+            def handle_mapping(msg):
+                if isinstance(msg, db.SymbolMappingMsg):
+                    self.instrument_map[msg.instrument_id] = msg.stype_in_symbol
+                    logger.info(f"Mapped instrument {msg.instrument_id} to {msg.stype_in_symbol}")
+
+            self.client.add_callback(handle_mapping)
+            
             self.running = True
             logger.info("Feed started successfully")
             
@@ -70,8 +79,11 @@ class LiveQuoteManager:
                     
                 if isinstance(record, db.TradeMsg):
                     try:
-                        # Get the ticker symbol from the record
-                        ticker = record.symbol
+                        # Get the ticker symbol from the instrument map
+                        ticker = self.instrument_map.get(record.instrument_id)
+                        
+                        if not ticker or ticker not in self.SUPPORTED_TICKERS:
+                            continue
                         
                         ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
                         
@@ -182,7 +194,8 @@ async def health_check():
             ticker: update_time.strftime('%Y-%m-%d %H:%M:%S UTC')
             for ticker, update_time in quote_manager.last_updates.items()
         },
-        "running": quote_manager.running
+        "running": quote_manager.running,
+        "mapped_instruments": len(quote_manager.instrument_map)
     }
 
 def start_feed():
