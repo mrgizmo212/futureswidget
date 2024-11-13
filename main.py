@@ -6,8 +6,9 @@ import threading
 import logging
 import os
 from typing import Dict, Any
+from threading import Lock
 
-app = FastAPI(title="ES Futures Quote API")
+app = FastAPI(title="Futures Quotes API")
 
 # Enhanced CORS configuration
 app.add_middleware(
@@ -33,22 +34,31 @@ logger = logging.getLogger(__name__)
 
 class LiveQuoteManager:
     def __init__(self):
-        self.latest_quotes = {"ES.c.0": {"error": "Initializing feed..."}}
+        # Define supported tickers
+        self.SUPPORTED_TICKERS = ["ES.c.0", "NQ.c.0", "RTY.c.0", "BTC.c.0"]
+        
+        # Initialize quotes dictionary for all tickers
+        self.latest_quotes = {
+            ticker: {"error": "Initializing feed..."} 
+            for ticker in self.SUPPORTED_TICKERS
+        }
+        
         self.client = None
         self.running = False
-        self.last_update = datetime.now(timezone.utc)
+        self.last_updates = {ticker: datetime.now(timezone.utc) for ticker in self.SUPPORTED_TICKERS}
+        self.lock = Lock()
 
     def start_live_feed(self):
         try:
             logger.info("Connecting to Databento...")
             self.client = db.Live(key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK")
             
-            logger.info("Subscribing to ES futures...")
+            logger.info("Subscribing to futures...")
             self.client.subscribe(
                 dataset="GLBX.MDP3",
                 schema="trades",
                 stype_in="continuous",
-                symbols=["ES.c.0"]
+                symbols=self.SUPPORTED_TICKERS
             )
             
             self.running = True
@@ -60,10 +70,13 @@ class LiveQuoteManager:
                     
                 if isinstance(record, db.TradeMsg):
                     try:
+                        # Get the ticker symbol from the record
+                        ticker = record.symbol
+                        
                         ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
                         
                         quote_data = {
-                            "symbol": "ES",
+                            "symbol": ticker.split('.')[0],  # Remove the .c.0 suffix
                             "price": float(record.price) / 1e9,
                             "size": int(record.size),
                             "timestamp": ts_event.strftime('%H:%M:%S'),
@@ -72,9 +85,11 @@ class LiveQuoteManager:
                             "status": "live"
                         }
                         
-                        self.latest_quotes["ES.c.0"] = quote_data
-                        self.last_update = datetime.now(timezone.utc)
-                        logger.info(f"Updated quote: {quote_data}")
+                        with self.lock:
+                            self.latest_quotes[ticker] = quote_data
+                            self.last_updates[ticker] = datetime.now(timezone.utc)
+                        
+                        logger.info(f"Updated quote for {ticker}: {quote_data}")
                         
                     except Exception as e:
                         logger.error(f"Error processing record: {str(e)}")
@@ -82,7 +97,9 @@ class LiveQuoteManager:
         except Exception as e:
             error_msg = f"Feed error: {str(e)}"
             logger.error(error_msg)
-            self.latest_quotes["ES.c.0"] = {"error": error_msg}
+            with self.lock:
+                for ticker in self.SUPPORTED_TICKERS:
+                    self.latest_quotes[ticker] = {"error": error_msg}
 
     def stop_live_feed(self):
         self.running = False
@@ -90,22 +107,56 @@ class LiveQuoteManager:
             self.client.stop()
         logger.info("Feed stopped")
 
-    def is_feed_healthy(self) -> bool:
+    def is_feed_healthy(self, ticker: str = None) -> bool:
         """Check if feed is healthy and updating"""
         if not self.running:
             return False
-        time_since_update = (datetime.now(timezone.utc) - self.last_update).seconds
-        return time_since_update < 30  # Consider feed healthy if updated within 30 seconds
+            
+        current_time = datetime.now(timezone.utc)
+        
+        if ticker:
+            # Check specific ticker
+            time_since_update = (current_time - self.last_updates.get(ticker, current_time)).seconds
+            return time_since_update < 30
+        else:
+            # Check all tickers
+            return all(
+                (current_time - update_time).seconds < 30
+                for update_time in self.last_updates.values()
+            )
 
 quote_manager = LiveQuoteManager()
 
 @app.get("/")
-async def get_quote() -> Dict[str, Any]:
-    """Get the latest ES futures quote"""
+async def get_quotes(symbol: str = None) -> Dict[str, Any]:
+    """Get the latest futures quotes"""
+    if symbol:
+        # Convert to continuous contract format if needed
+        ticker = f"{symbol.upper()}.c.0"
+        if ticker not in quote_manager.SUPPORTED_TICKERS:
+            raise HTTPException(status_code=400, detail="Invalid symbol")
+            
+        if not quote_manager.is_feed_healthy(ticker):
+            return {
+                "quotes": {ticker: {"error": "Feed unavailable - reconnecting..."}},
+                "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                "status": "unhealthy"
+            }
+            
+        return {
+            "quotes": {ticker: quote_manager.latest_quotes[ticker]},
+            "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+            "status": "healthy"
+        }
+    
+    # Return all quotes if no symbol specified
     if not quote_manager.is_feed_healthy():
         logger.warning("Feed appears to be stale or not running")
         return {
-            "quotes": {"ES.c.0": {"error": "Feed unavailable - reconnecting..."}},
+            "quotes": {
+                ticker: {"error": "Feed unavailable - reconnecting..."}
+                for ticker in quote_manager.SUPPORTED_TICKERS
+            },
             "server_time": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
             "status": "unhealthy"
         }
@@ -119,9 +170,18 @@ async def get_quote() -> Dict[str, Any]:
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    health_status = {
+        ticker: quote_manager.is_feed_healthy(ticker)
+        for ticker in quote_manager.SUPPORTED_TICKERS
+    }
+    
     return {
-        "status": "healthy" if quote_manager.is_feed_healthy() else "unhealthy",
-        "last_update": quote_manager.last_update.strftime('%Y-%m-%d %H:%M:%S UTC'),
+        "status": "healthy" if all(health_status.values()) else "unhealthy",
+        "ticker_status": health_status,
+        "last_updates": {
+            ticker: update_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            for ticker, update_time in quote_manager.last_updates.items()
+        },
         "running": quote_manager.running
     }
 
@@ -142,7 +202,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up on shutdown"""
-    quote_manager.stop_feed()
+    quote_manager.stop_live_feed()
     logger.info("Application shutting down")
 
 if __name__ == "__main__":
