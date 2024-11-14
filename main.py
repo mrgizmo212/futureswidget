@@ -254,6 +254,7 @@ app.add_middleware(
     allow_origins=[
         "https://truetradinggroup.com",
         "https://www.truetradinggroup.com",
+        "https://futureswidget.onrender.com",
         "http://localhost:8881",
         "http://localhost",
         "http://127.0.0.1:8000",
