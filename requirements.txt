@@ -7,3 +7,4 @@ pydantic
 typing-extensions
 pytz
 python-multipart
+uvloop
