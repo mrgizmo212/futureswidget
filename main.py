@@ -1,331 +1,176 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import databento as db
 from datetime import datetime, timezone
 import threading
 import logging
-import logging.handlers
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any
 from threading import Lock
 from pytz import timezone as pytz_timezone
-import time
-import traceback
-from enum import Enum
-from dataclasses import dataclass
-from contextlib import contextmanager
 
-# Configure logging with rotation
-LOG_FILENAME = "futures_quotes.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            LOG_FILENAME, maxBytes=5*1024*1024, backupCount=5
-        ),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class FeedState(Enum):
-    """Enum representing possible states of the data feed"""
-    INITIALIZING = "initializing"
-    CONNECTING = "connecting"
-    RUNNING = "running"
-    RECONNECTING = "reconnecting"
-    ERROR = "error"
-    STOPPED = "stopped"
-
-@dataclass
-class QuoteData:
-    """Data class for storing quote information"""
-    symbol: str
-    price: float
-    size: int
-    timestamp: str
-    side: str
-    date: str
-    status: str
-
-class FeedHealthMonitor:
-    """Monitors the health of the data feed including heartbeats and updates"""
-    
-    def __init__(self):
-        self.last_heartbeat = datetime.now(timezone.utc)
-        self.last_updates: Dict[str, datetime] = {}
-        self.lock = Lock()
-        
-    def update_heartbeat(self):
-        """Update the last heartbeat timestamp"""
-        with self.lock:
-            self.last_heartbeat = datetime.now(timezone.utc)
-            
-    def update_ticker(self, ticker: str):
-        """Update the last update timestamp for a specific ticker"""
-        with self.lock:
-            self.last_updates[ticker] = datetime.now(timezone.utc)
-            
-    def is_healthy(self, ticker: Optional[str] = None) -> bool:
-        """Check if the feed is healthy for a specific ticker or overall"""
-        current_time = datetime.now(timezone.utc)
-        
-        with self.lock:
-            # Check heartbeat health - 60 second timeout
-            heartbeat_age = (current_time - self.last_heartbeat).total_seconds()
-            if heartbeat_age > 60:
-                return False
-                
-            if ticker:
-                if ticker not in self.last_updates:
-                    return False
-                time_since_update = (current_time - self.last_updates[ticker]).total_seconds()
-                timeout = 60  # 60 second timeout for all tickers
-                return time_since_update < timeout
-            
-            # Check all tickers with 60 second timeout
-            return all(
-                (current_time - update_time).total_seconds() < 60
-                for update_time in self.last_updates.values()
-            )
-
-class LiveQuoteManager:
-    """Manages real-time quotes from Databento, including feed health and reconnection"""
-    
-    def __init__(self):
-        self.SUPPORTED_TICKERS: List[str] = ["ES.c.0", "NQ.c.0", "RTY.c.0", "BTC.c.0"]
-        self.latest_quotes = {
-            ticker: {"error": "Initializing feed..."} 
-            for ticker in self.SUPPORTED_TICKERS
-        }
-        self.client: Optional[db.Live] = None
-        self.running = False
-        self.lock = Lock()
-        self.state_lock = Lock()
-        self.feed_state = FeedState.INITIALIZING
-        self.health_monitor = FeedHealthMonitor()
-        self.instrument_map: Dict[int, str] = {}
-        self.eastern_tz = pytz_timezone('America/New_York')
-        self.connection_attempts = 0
-        self.MAX_RECONNECT_ATTEMPTS = 5
-        self.RECONNECT_DELAY = 5
-        self.DATABENTO_KEY = "db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK"  # Databento key as provided
-
-    @contextmanager
-    def state_transition(self, new_state: FeedState):
-        """Context manager for handling state transitions"""
-        try:
-            with self.state_lock:
-                old_state = self.feed_state
-                self.feed_state = new_state
-                logger.info(f"Feed state transition: {old_state.value} -> {new_state.value}")
-            yield
-        except Exception as e:
-            logger.error(f"Error in state {new_state.value}: {str(e)}")
-            with self.state_lock:
-                self.feed_state = FeedState.ERROR
-            raise
-
-    def get_state(self) -> FeedState:
-        """Get the current feed state"""
-        with self.state_lock:
-            return self.feed_state
-
-    def process_message(self, record: db.DBNRecord):
-        """Process incoming messages based on their type with proper type checking"""
-        try:
-            if isinstance(record, db.SystemMsg):
-                if hasattr(record, 'is_heartbeat') and record.is_heartbeat():
-                    self.health_monitor.update_heartbeat()
-                    logger.debug("Heartbeat received")
-            elif isinstance(record, db.SymbolMappingMsg):
-                if hasattr(record, 'stype_in_symbol'):
-                    with self.lock:
-                        self.instrument_map[record.instrument_id] = record.stype_in_symbol
-                        logger.info(f"Mapped instrument {record.instrument_id} to {record.stype_in_symbol}")
-            elif isinstance(record, db.TradeMsg):
-                self.process_trade(record)
-        except Exception as e:
-            logger.error(f"Error processing message: {str(e)}\n{traceback.format_exc()}")
-
-    def process_trade(self, record: db.TradeMsg):
-        """Process trade messages and update quotes"""
-        try:
-            with self.lock:
-                ticker = self.instrument_map.get(record.instrument_id)
-                
-            if not ticker or ticker not in self.SUPPORTED_TICKERS:
-                return
-                
-            ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
-            ts_event_eastern = ts_event.astimezone(self.eastern_tz)
-            
-            quote_data = QuoteData(
-                symbol=ticker.split('.')[0],
-                price=float(record.price) / 1e9,
-                size=int(record.size),
-                timestamp=ts_event_eastern.strftime('%I:%M:%S %p'),
-                side=record.side,
-                date=ts_event_eastern.strftime('%Y-%m-%d'),
-                status="live"
-            )
-            
-            with self.lock:
-                self.latest_quotes[ticker] = quote_data.__dict__
-            
-            self.health_monitor.update_ticker(ticker)
-            logger.info(f"Updated quote for {ticker}: {quote_data.__dict__}")
-            
-        except Exception as e:
-            logger.error(f"Error processing trade: {str(e)}\n{traceback.format_exc()}")
-
-    def start_live_feed(self):
-        """Start the live data feed with automatic reconnection"""
-        self.running = True
-
-        while self.running:
-            try:
-                with self.state_transition(FeedState.CONNECTING):
-                    logger.info("Connecting to Databento...")
-                    self.client = db.Live(
-                        key=self.DATABENTO_KEY,
-                        reconnect_policy="reconnect",
-                        heartbeat_interval_s=5,
-                        ts_out=False
-                    )
-
-                    # Set up message handler
-                    self.client.add_callback(self.process_message)
-
-                    logger.info("Subscribing to futures...")
-                    self.client.subscribe(
-                        dataset="GLBX.MDP3",
-                        schema="trades",
-                        stype_in="continuous",
-                        symbols=self.SUPPORTED_TICKERS
-                    )
-
-                with self.state_transition(FeedState.RUNNING):
-                    for record in self.client:
-                        if not self.running:
-                            break
-
-                    logger.info("Feed stream ended")
-
-            except Exception as e:
-                logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
-
-                with self.state_transition(FeedState.RECONNECTING):
-                    self.connection_attempts += 1
-
-                    if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
-                        logger.error("Max reconnection attempts reached")
-                        self.running = False
-                        break
-
-                    logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
-                    time.sleep(self.RECONNECT_DELAY)
-
-        with self.state_transition(FeedState.STOPPED):
-            logger.info("Feed stopped")
-
-    def stop_live_feed(self):
-        """Stop the live data feed"""
-        self.running = False
-        if self.client:
-            self.client.stop()
-        logger.info("Feed stopped")
-
-    def is_feed_healthy(self, ticker: str = None) -> bool:
-        """Check if the feed is healthy"""
-        return (
-            self.get_state() == FeedState.RUNNING 
-            and self.health_monitor.is_healthy(ticker)
-        )
-
-# Initialize FastAPI application
 app = FastAPI(title="Futures Quotes API")
 
-# Configure CORS
+# Enhanced CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://truetradinggroup.com",
         "https://www.truetradinggroup.com",
-        "https://futureswidget.onrender.com",
         "http://localhost:8881",
         "http://localhost",
         "http://127.0.0.1:8000",
     ],
     allow_methods=["GET"],
     allow_headers=["*"],
-    max_age=3600,
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
-# Initialize quote manager
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class LiveQuoteManager:
+    def __init__(self):
+        # Define supported tickers
+        self.SUPPORTED_TICKERS = ["ES.c.0", "NQ.c.0", "RTY.c.0", "BTC.c.0"]
+        
+        # Initialize quotes dictionary for all tickers
+        self.latest_quotes = {
+            ticker: {"error": "Initializing feed..."} 
+            for ticker in self.SUPPORTED_TICKERS
+        }
+        
+        self.client = None
+        self.running = False
+        self.last_updates = {ticker: datetime.now(timezone.utc) for ticker in self.SUPPORTED_TICKERS}
+        self.lock = Lock()
+        self.instrument_map = {}
+        
+        # Initialize timezone
+        self.eastern_tz = pytz_timezone('America/New_York')
+
+    def start_live_feed(self):
+        try:
+            logger.info("Connecting to Databento...")
+            self.client = db.Live(key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK")
+            
+            logger.info("Subscribing to futures...")
+            self.client.subscribe(
+                dataset="GLBX.MDP3",
+                schema="trades",
+                stype_in="continuous",
+                symbols=self.SUPPORTED_TICKERS
+            )
+            
+            # Initialize symbol mapping
+            def handle_mapping(msg):
+                if isinstance(msg, db.SymbolMappingMsg):
+                    self.instrument_map[msg.instrument_id] = msg.stype_in_symbol
+                    logger.info(f"Mapped instrument {msg.instrument_id} to {msg.stype_in_symbol}")
+
+            self.client.add_callback(handle_mapping)
+            
+            self.running = True
+            logger.info("Feed started successfully")
+            
+            for record in self.client:
+                if not self.running:
+                    break
+                    
+                if isinstance(record, db.TradeMsg):
+                    try:
+                        # Get the ticker symbol from the instrument map
+                        ticker = self.instrument_map.get(record.instrument_id)
+                        
+                        if not ticker or ticker not in self.SUPPORTED_TICKERS:
+                            continue
+                        
+                        # Convert UTC timestamp to Eastern Time
+                        ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
+                        ts_event_eastern = ts_event.astimezone(self.eastern_tz)
+                        
+                        quote_data = {
+                            "symbol": ticker.split('.')[0],  # Remove the .c.0 suffix
+                            "price": float(record.price) / 1e9,
+                            "size": int(record.size),
+                            "timestamp": ts_event_eastern.strftime('%I:%M:%S %p'),  # 12-hour format with AM/PM
+                            "side": record.side,
+                            "date": ts_event_eastern.strftime('%Y-%m-%d'),
+                            "status": "live"
+                        }
+                        
+                        with self.lock:
+                            self.latest_quotes[ticker] = quote_data
+                            self.last_updates[ticker] = datetime.now(timezone.utc)
+                        
+                        logger.info(f"Updated quote for {ticker}: {quote_data}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing record: {str(e)}")
+                        
+        except Exception as e:
+            error_msg = f"Feed error: {str(e)}"
+            logger.error(error_msg)
+            with self.lock:
+                for ticker in self.SUPPORTED_TICKERS:
+                    self.latest_quotes[ticker] = {"error": error_msg}
+
+    def stop_live_feed(self):
+        self.running = False
+        if self.client:
+            self.client.stop()
+        logger.info("Feed stopped")
+
+    def is_feed_healthy(self, ticker: str = None) -> bool:
+        """Check if feed is healthy and updating"""
+        if not self.running:
+            return False
+            
+        current_time = datetime.now(timezone.utc)
+        
+        if ticker:
+            # Check specific ticker
+            time_since_update = (current_time - self.last_updates.get(ticker, current_time)).seconds
+            return time_since_update < 30
+        else:
+            # Check all tickers
+            return all(
+                (current_time - update_time).seconds < 30
+                for update_time in self.last_updates.values()
+            )
+
 quote_manager = LiveQuoteManager()
 
-@app.on_event("startup")
-async def startup_event():
-    """Startup event function"""
-    logger.info("Starting application...")
-    start_feed()
-    logger.info("Application started")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown event function"""
-    logger.info("Application shutting down...")
-    quote_manager.stop_live_feed()
-    logger.info("Application shutdown complete")
-
-def start_feed():
-    """Start the feed in a separate thread"""
-    feed_thread = threading.Thread(
-        target=quote_manager.start_live_feed,
-        name="FeedThread",
-        daemon=True
-    )
-    feed_thread.start()
-    logger.info("Feed thread started")
-
 @app.get("/")
-async def get_quotes(
-    request: Request,
-    symbol: Optional[str] = None
-) -> Dict[str, Any]:
+async def get_quotes(symbol: str = None) -> Dict[str, Any]:
     """Get the latest futures quotes"""
     current_time = datetime.now(timezone.utc)
     eastern_time = current_time.astimezone(quote_manager.eastern_tz)
     
-    logger.info(f"Quote request from {request.client.host} for symbol: {symbol}")
-    
     if symbol:
+        # Convert to continuous contract format if needed
         ticker = f"{symbol.upper()}.c.0"
         if ticker not in quote_manager.SUPPORTED_TICKERS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid symbol. Supported symbols: {[t.split('.')[0] for t in quote_manager.SUPPORTED_TICKERS]}"
-            )
+            raise HTTPException(status_code=400, detail="Invalid symbol")
             
         if not quote_manager.is_feed_healthy(ticker):
-            logger.warning(f"Feed appears to be stale or not running for {ticker}")
             return {
                 "quotes": {ticker: {"error": "Feed unavailable - reconnecting..."}},
                 "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
                 "status": "unhealthy"
             }
             
-        with quote_manager.lock:
-            quote = quote_manager.latest_quotes.get(ticker, {"error": "No data available"})
-        
         return {
-            "quotes": {ticker: quote},
+            "quotes": {ticker: quote_manager.latest_quotes[ticker]},
             "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "healthy"
         }
     
+    # Return all quotes if no symbol specified
     if not quote_manager.is_feed_healthy():
         logger.warning("Feed appears to be stale or not running")
         return {
@@ -336,18 +181,15 @@ async def get_quotes(
             "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "unhealthy"
         }
-
-    with quote_manager.lock:
-        quotes = quote_manager.latest_quotes.copy()
     
     return {
-        "quotes": quotes,
+        "quotes": quote_manager.latest_quotes,
         "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
         "status": "healthy"
     }
 
 @app.get("/health")
-async def health_check() -> Dict[str, Any]:
+async def health_check():
     """Health check endpoint"""
     current_time = datetime.now(timezone.utc)
     eastern_time = current_time.astimezone(quote_manager.eastern_tz)
@@ -359,13 +201,36 @@ async def health_check() -> Dict[str, Any]:
     
     return {
         "status": "healthy" if all(health_status.values()) else "unhealthy",
-        "feed_state": quote_manager.get_state().value,
         "ticker_status": health_status,
+        "last_updates": {
+            ticker: update_time.astimezone(quote_manager.eastern_tz).strftime('%Y-%m-%d %I:%M:%S %p %Z')
+            for ticker, update_time in quote_manager.last_updates.items()
+        },
         "current_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
         "running": quote_manager.running
     }
 
+def start_feed():
+    """Start the feed in a separate thread"""
+    feed_thread = threading.Thread(target=quote_manager.start_live_feed)
+    feed_thread.daemon = True
+    feed_thread.start()
+    logger.info("Feed thread started")
+
+# Start the feed when app starts
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the feed on startup"""
+    start_feed()
+    logger.info("Application started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown"""
+    quote_manager.stop_live_feed()
+    logger.info("Application shutting down")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
