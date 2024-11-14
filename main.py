@@ -14,7 +14,6 @@ import traceback
 from enum import Enum
 from dataclasses import dataclass
 from contextlib import contextmanager
-from contextlib import asynccontextmanager
 
 # Configure logging with rotation
 LOG_FILENAME = "futures_quotes.log"
@@ -111,7 +110,7 @@ class LiveQuoteManager:
         self.connection_attempts = 0
         self.MAX_RECONNECT_ATTEMPTS = 5
         self.RECONNECT_DELAY = 5
-        self.DATABENTO_KEY = "db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK"  # Databento key directly in code
+        self.DATABENTO_KEY = "db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK"  # Databento key as provided
 
     @contextmanager
     def state_transition(self, new_state: FeedState):
@@ -184,21 +183,21 @@ class LiveQuoteManager:
     def start_live_feed(self):
         """Start the live data feed with automatic reconnection"""
         self.running = True
-        
+
         while self.running:
             try:
                 with self.state_transition(FeedState.CONNECTING):
                     logger.info("Connecting to Databento...")
                     self.client = db.Live(
-                        key=self.DATABENTO_KEY,  # Use direct key
+                        key=self.DATABENTO_KEY,
                         reconnect_policy="reconnect",
                         heartbeat_interval_s=5,
-                        ts_out=True
+                        ts_out=False
                     )
-                    
+
                     # Set up message handler
                     self.client.add_callback(self.process_message)
-                    
+
                     logger.info("Subscribing to futures...")
                     self.client.subscribe(
                         dataset="GLBX.MDP3",
@@ -206,28 +205,28 @@ class LiveQuoteManager:
                         stype_in="continuous",
                         symbols=self.SUPPORTED_TICKERS
                     )
-                    
+
                 with self.state_transition(FeedState.RUNNING):
                     for record in self.client:
                         if not self.running:
                             break
-                            
+
                     logger.info("Feed stream ended")
-                    
+
             except Exception as e:
                 logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
-                
+
                 with self.state_transition(FeedState.RECONNECTING):
                     self.connection_attempts += 1
-                    
+
                     if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
                         logger.error("Max reconnection attempts reached")
                         self.running = False
                         break
-                        
+
                     logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
                     time.sleep(self.RECONNECT_DELAY)
-                    
+
         with self.state_transition(FeedState.STOPPED):
             logger.info("Feed stopped")
 
@@ -267,6 +266,30 @@ app.add_middleware(
 # Initialize quote manager
 quote_manager = LiveQuoteManager()
 
+@app.on_event("startup")
+async def startup_event():
+    """Startup event function"""
+    logger.info("Starting application...")
+    start_feed()
+    logger.info("Application started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown event function"""
+    logger.info("Application shutting down...")
+    quote_manager.stop_live_feed()
+    logger.info("Application shutdown complete")
+
+def start_feed():
+    """Start the feed in a separate thread"""
+    feed_thread = threading.Thread(
+        target=quote_manager.start_live_feed,
+        name="FeedThread",
+        daemon=True
+    )
+    feed_thread.start()
+    logger.info("Feed thread started")
+
 @app.get("/")
 async def get_quotes(
     request: Request,
@@ -287,14 +310,18 @@ async def get_quotes(
             )
             
         if not quote_manager.is_feed_healthy(ticker):
+            logger.warning(f"Feed appears to be stale or not running for {ticker}")
             return {
                 "quotes": {ticker: {"error": "Feed unavailable - reconnecting..."}},
                 "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
                 "status": "unhealthy"
             }
             
+        with quote_manager.lock:
+            quote = quote_manager.latest_quotes.get(ticker, {"error": "No data available"})
+        
         return {
-            "quotes": {ticker: quote_manager.latest_quotes[ticker]},
+            "quotes": {ticker: quote},
             "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "healthy"
         }
@@ -309,9 +336,12 @@ async def get_quotes(
             "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
             "status": "unhealthy"
         }
+
+    with quote_manager.lock:
+        quotes = quote_manager.latest_quotes.copy()
     
     return {
-        "quotes": quote_manager.latest_quotes,
+        "quotes": quotes,
         "server_time": eastern_time.strftime('%Y-%m-%d %I:%M:%S %p %Z'),
         "status": "healthy"
     }
@@ -335,36 +365,7 @@ async def health_check() -> Dict[str, Any]:
         "running": quote_manager.running
     }
 
-def start_feed():
-    """Start the feed in a separate thread"""
-    feed_thread = threading.Thread(
-        target=quote_manager.start_live_feed,
-        name="FeedThread",
-        daemon=True
-    )
-    feed_thread.start()
-    logger.info("Feed thread started")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for the FastAPI application"""
-    # Startup
-    logger.info("Starting application...")
-    start_feed()
-    logger.info("Application started")
-    
-    yield  # Run the application
-    
-    # Shutdown
-    logger.info("Application shutting down...")
-    quote_manager.stop_live_feed()
-    logger.info("Application shutdown complete")
-
-# Update FastAPI initialization
-app = FastAPI(
-    title="Futures Quotes API",
-    lifespan=lifespan
-)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
