@@ -182,54 +182,56 @@ class LiveQuoteManager:
             logger.error(f"Error processing trade: {str(e)}\n{traceback.format_exc()}")
 
     def start_live_feed(self):
-        """Start the live data feed with automatic reconnection"""
-        self.running = True
-        
-        while self.running:
-            try:
-                with self.state_transition(FeedState.CONNECTING):
-                    logger.info("Connecting to Databento...")
-                    self.client = db.Live(
-                        key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK",
-                        reconnect_policy="reconnect",
-                        heartbeat_interval_s=5,
-                        ts_out=True
-                    )
-                    
-                    # Set up message handler
-                    self.client.add_callback(self.process_message)
-                    
-                    logger.info("Subscribing to futures...")
+    """Start the live data feed with automatic reconnection"""
+    self.running = True
+    
+    while self.running:
+        try:
+            with self.state_transition(FeedState.CONNECTING):
+                logger.info("Connecting to Databento...")
+                self.client = db.Live(
+                    key=os.getenv("DATABENTO_KEY"),
+                    reconnect_policy="reconnect",
+                    heartbeat_interval_s=5,
+                    ts_out=True,
+                    timeout=60  # Increase timeout
+                )
+                
+                # Set up message handler
+                self.client.add_callback(self.process_message)
+                
+                logger.info("Subscribing to futures...")
+                try:
                     self.client.subscribe(
                         dataset="GLBX.MDP3",
                         schema="trades",
                         stype_in="continuous",
                         symbols=self.SUPPORTED_TICKERS
                     )
+                except Exception as sub_e:
+                    logger.error(f"Subscription error: {str(sub_e)}")
+                    raise
                     
-                with self.state_transition(FeedState.RUNNING):
-                    for record in self.client:
-                        if not self.running:
-                            break
-                            
-                    logger.info("Feed stream ended")
-                    
-            except Exception as e:
-                logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
-                
-                with self.state_transition(FeedState.RECONNECTING):
-                    self.connection_attempts += 1
-                    
-                    if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
-                        logger.error("Max reconnection attempts reached")
-                        self.running = False
+            with self.state_transition(FeedState.RUNNING):
+                for record in self.client:
+                    if not self.running:
                         break
                         
-                    logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
-                    time.sleep(self.RECONNECT_DELAY)
+                logger.info("Feed stream ended")
+                
+        except Exception as e:
+            logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
+            
+            with self.state_transition(FeedState.RECONNECTING):
+                self.connection_attempts += 1
+                
+                if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
+                    logger.error("Max reconnection attempts reached")
+                    self.running = False
+                    break
                     
-        with self.state_transition(FeedState.STOPPED):
-            logger.info("Feed stopped")
+                logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
+                time.sleep(self.RECONNECT_DELAY)
 
     def stop_live_feed(self):
         """Stop the live data feed"""
