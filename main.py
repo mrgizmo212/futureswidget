@@ -188,7 +188,7 @@ class LiveQuoteManager:
                 with self.state_transition(FeedState.CONNECTING):
                     logger.info("Connecting to Databento...")
                     self.client = db.Live(
-                        key=os.getenv("DATABENTO_KEY"),
+                        key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK",  # Direct key instead of environment variable
                         reconnect_policy="reconnect",
                         heartbeat_interval_s=5,
                         ts_out=True
