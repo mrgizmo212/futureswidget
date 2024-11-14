@@ -72,22 +72,22 @@ class FeedHealthMonitor:
         current_time = datetime.now(timezone.utc)
         
         with self.lock:
-            # Check heartbeat health
+            # Check heartbeat health with 60-second timeout
             heartbeat_age = (current_time - self.last_heartbeat).total_seconds()
-            if heartbeat_age > 10:  # No heartbeat for 10 seconds
+            if heartbeat_age > 60:  # Changed from 10 to 60 seconds
                 return False
                 
             if ticker:
                 if ticker not in self.last_updates:
                     return False
                 time_since_update = (current_time - self.last_updates[ticker]).total_seconds()
-                # Allow longer timeout for certain tickers
-                timeout = 60 if ticker in ["BTC.c.0"] else 30
+                # All tickers now have 60-second timeout
+                timeout = 60  # Same timeout for all tickers
                 return time_since_update < timeout
             
-            # Check all tickers
+            # Check all tickers with 60-second timeout
             return all(
-                (current_time - update_time).total_seconds() < 30
+                (current_time - update_time).total_seconds() < 60
                 for update_time in self.last_updates.values()
             )
 
@@ -151,14 +151,12 @@ class LiveQuoteManager:
     def process_trade(self, record: db.TradeMsg):
         """Process trade messages and update quotes"""
         try:
-            # Get the ticker symbol from the instrument map
             with self.lock:
                 ticker = self.instrument_map.get(record.instrument_id)
                 
             if not ticker or ticker not in self.SUPPORTED_TICKERS:
                 return
                 
-            # Convert UTC timestamp to Eastern Time
             ts_event = datetime.fromtimestamp(record.ts_event / 1e9, tz=timezone.utc)
             ts_event_eastern = ts_event.astimezone(self.eastern_tz)
             
@@ -182,56 +180,53 @@ class LiveQuoteManager:
             logger.error(f"Error processing trade: {str(e)}\n{traceback.format_exc()}")
 
     def start_live_feed(self):
-    """Start the live data feed with automatic reconnection"""
-    self.running = True
-    
-    while self.running:
-        try:
-            with self.state_transition(FeedState.CONNECTING):
-                logger.info("Connecting to Databento...")
-                self.client = db.Live(
-                    key=os.getenv("DATABENTO_KEY"),
-                    reconnect_policy="reconnect",
-                    heartbeat_interval_s=5,
-                    ts_out=True,
-                    timeout=60  # Increase timeout
-                )
-                
-                # Set up message handler
-                self.client.add_callback(self.process_message)
-                
-                logger.info("Subscribing to futures...")
-                try:
+        """Start the live data feed with automatic reconnection"""
+        self.running = True
+        
+        while self.running:
+            try:
+                with self.state_transition(FeedState.CONNECTING):
+                    logger.info("Connecting to Databento...")
+                    self.client = db.Live(
+                        key=os.getenv("DATABENTO_KEY"),
+                        reconnect_policy="reconnect",
+                        heartbeat_interval_s=5,
+                        ts_out=True
+                    )
+                    
+                    self.client.add_callback(self.process_message)
+                    
+                    logger.info("Subscribing to futures...")
                     self.client.subscribe(
                         dataset="GLBX.MDP3",
                         schema="trades",
                         stype_in="continuous",
                         symbols=self.SUPPORTED_TICKERS
                     )
-                except Exception as sub_e:
-                    logger.error(f"Subscription error: {str(sub_e)}")
-                    raise
                     
-            with self.state_transition(FeedState.RUNNING):
-                for record in self.client:
-                    if not self.running:
+                with self.state_transition(FeedState.RUNNING):
+                    for record in self.client:
+                        if not self.running:
+                            break
+                            
+                    logger.info("Feed stream ended")
+                    
+            except Exception as e:
+                logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
+                
+                with self.state_transition(FeedState.RECONNECTING):
+                    self.connection_attempts += 1
+                    
+                    if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
+                        logger.error("Max reconnection attempts reached")
+                        self.running = False
                         break
                         
-                logger.info("Feed stream ended")
-                
-        except Exception as e:
-            logger.error(f"Feed error: {str(e)}\n{traceback.format_exc()}")
-            
-            with self.state_transition(FeedState.RECONNECTING):
-                self.connection_attempts += 1
-                
-                if self.connection_attempts >= self.MAX_RECONNECT_ATTEMPTS:
-                    logger.error("Max reconnection attempts reached")
-                    self.running = False
-                    break
+                    logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
+                    time.sleep(self.RECONNECT_DELAY)
                     
-                logger.info(f"Attempting to reconnect... ({self.connection_attempts}/{self.MAX_RECONNECT_ATTEMPTS})")
-                time.sleep(self.RECONNECT_DELAY)
+        with self.state_transition(FeedState.STOPPED):
+            logger.info("Feed stopped")
 
     def stop_live_feed(self):
         """Stop the live data feed"""
@@ -247,10 +242,8 @@ class LiveQuoteManager:
             and self.health_monitor.is_healthy(ticker)
         )
 
-# Initialize FastAPI application
 app = FastAPI(title="Futures Quotes API")
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -265,7 +258,6 @@ app.add_middleware(
     max_age=3600,
 )
 
-# Initialize quote manager
 quote_manager = LiveQuoteManager()
 
 @app.get("/")
