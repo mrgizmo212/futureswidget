@@ -6,3 +6,4 @@ httpx
 pydantic
 typing-extensions
 pytz
+python-multipart
