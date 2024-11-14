@@ -1,3 +1,8 @@
+"""
+FastAPI application for real-time futures quotes using Databento.
+Implements thread-safe quote management, heartbeat monitoring, and automatic reconnection.
+"""
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import databento as db
@@ -72,20 +77,19 @@ class FeedHealthMonitor:
         current_time = datetime.now(timezone.utc)
         
         with self.lock:
-            # Check heartbeat health with 60-second timeout
+            # Check heartbeat health - 60 second timeout
             heartbeat_age = (current_time - self.last_heartbeat).total_seconds()
-            if heartbeat_age > 60:  # Changed from 10 to 60 seconds
+            if heartbeat_age > 60:
                 return False
                 
             if ticker:
                 if ticker not in self.last_updates:
                     return False
                 time_since_update = (current_time - self.last_updates[ticker]).total_seconds()
-                # All tickers now have 60-second timeout
-                timeout = 60  # Same timeout for all tickers
+                timeout = 60  # 60 second timeout for all tickers
                 return time_since_update < timeout
             
-            # Check all tickers with 60-second timeout
+            # Check all tickers with 60 second timeout
             return all(
                 (current_time - update_time).total_seconds() < 60
                 for update_time in self.last_updates.values()
@@ -111,6 +115,7 @@ class LiveQuoteManager:
         self.connection_attempts = 0
         self.MAX_RECONNECT_ATTEMPTS = 5
         self.RECONNECT_DELAY = 5
+        self.DATABENTO_KEY = "db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK"  # Databento key directly in code
 
     @contextmanager
     def state_transition(self, new_state: FeedState):
@@ -133,16 +138,17 @@ class LiveQuoteManager:
             return self.feed_state
 
     def process_message(self, record: db.DBNRecord):
-        """Process incoming messages based on their type"""
+        """Process incoming messages based on their type with proper type checking"""
         try:
             if isinstance(record, db.SystemMsg):
-                if record.is_heartbeat():
+                if hasattr(record, 'is_heartbeat') and record.is_heartbeat():
                     self.health_monitor.update_heartbeat()
                     logger.debug("Heartbeat received")
             elif isinstance(record, db.SymbolMappingMsg):
-                with self.lock:
-                    self.instrument_map[record.instrument_id] = record.stype_in_symbol
-                    logger.info(f"Mapped instrument {record.instrument_id} to {record.stype_in_symbol}")
+                if hasattr(record, 'stype_in_symbol'):
+                    with self.lock:
+                        self.instrument_map[record.instrument_id] = record.stype_in_symbol
+                        logger.info(f"Mapped instrument {record.instrument_id} to {record.stype_in_symbol}")
             elif isinstance(record, db.TradeMsg):
                 self.process_trade(record)
         except Exception as e:
@@ -188,12 +194,13 @@ class LiveQuoteManager:
                 with self.state_transition(FeedState.CONNECTING):
                     logger.info("Connecting to Databento...")
                     self.client = db.Live(
-                        key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK",  # Direct key instead of environment variable
+                        key=self.DATABENTO_KEY,  # Use direct key
                         reconnect_policy="reconnect",
                         heartbeat_interval_s=5,
                         ts_out=True
                     )
                     
+                    # Set up message handler
                     self.client.add_callback(self.process_message)
                     
                     logger.info("Subscribing to futures...")
@@ -242,8 +249,10 @@ class LiveQuoteManager:
             and self.health_monitor.is_healthy(ticker)
         )
 
+# Initialize FastAPI application
 app = FastAPI(title="Futures Quotes API")
 
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -258,6 +267,7 @@ app.add_middleware(
     max_age=3600,
 )
 
+# Initialize quote manager
 quote_manager = LiveQuoteManager()
 
 @app.get("/")
