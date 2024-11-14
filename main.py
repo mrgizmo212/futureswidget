@@ -1,8 +1,3 @@
-"""
-FastAPI application for real-time futures quotes using Databento.
-Implements thread-safe quote management, heartbeat monitoring, and automatic reconnection.
-"""
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import databento as db
@@ -19,6 +14,7 @@ import traceback
 from enum import Enum
 from dataclasses import dataclass
 from contextlib import contextmanager
+from contextlib import asynccontextmanager
 
 # Configure logging with rotation
 LOG_FILENAME = "futures_quotes.log"
@@ -348,18 +344,26 @@ def start_feed():
     feed_thread.start()
     logger.info("Feed thread started")
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the feed on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for the FastAPI application"""
+    # Startup
+    logger.info("Starting application...")
     start_feed()
     logger.info("Application started")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up on shutdown"""
+    
+    yield  # Run the application
+    
+    # Shutdown
+    logger.info("Application shutting down...")
     quote_manager.stop_live_feed()
-    logger.info("Application shutting down")
+    logger.info("Application shutdown complete")
 
+# Update FastAPI initialization
+app = FastAPI(
+    title="Futures Quotes API",
+    lifespan=lifespan
+)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
