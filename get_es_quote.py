@@ -19,7 +19,7 @@ class LiveQuoteManager:
 
     def start_live_feed(self):
         try:
-            self.client = db.Live(key=os.environ.get('DATABENTO_KEY', 'db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK'))
+            self.client = db.Live(key=os.environ.get('DATABENTO_KEY', ''))
             
             # Subscribe to ES continuous front month
             self.client.subscribe(
