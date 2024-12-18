@@ -37,7 +37,7 @@ class LiveQuoteManager:
     def start_live_feed(self):
         try:
             logger.info("Connecting to Databento...")
-            self.client = db.Live(key="db-eAhRWMKCiJLEpDAk8cvbFSeUWSXCK")
+            self.client = db.Live(key="")
             
             logger.info("Subscribing to ES futures...")
             self.client.subscribe(
